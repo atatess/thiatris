@@ -6,3 +6,7 @@ struct ContentView: View {
         BrickwellGameView()
     }
 }
+
+#Preview {
+    ContentView()
+}
