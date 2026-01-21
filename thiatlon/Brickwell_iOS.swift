@@ -108,27 +108,41 @@ class Grid {
     }
 
     func preBuildTower() {
-        // Fill the tower base completely first
+        // Fill the entire tower (both playable and decorative) to the same height
         for y in 0..<BrickwellConstants.towerBaseHeight {
             for x in 0..<BrickwellConstants.totalCircumference {
                 cells[y][x] = 1
             }
         }
 
-        // Fill decorative ring for rows above tower base
-        for y in BrickwellConstants.towerBaseHeight..<BrickwellConstants.gridHeight {
-            for x in BrickwellConstants.gridWidth..<BrickwellConstants.totalCircumference {
-                cells[y][x] = 1
+        // Pizza slice wedge cut parameters
+        let wedgeCenterX = BrickwellConstants.gridWidth / 2  // Center of playable area (x=7)
+        let wedgeDepth = 8  // How many rows deep the wedge goes from the top
+        let wedgeTopWidth = 3  // Width at the top of the wedge
+        let wedgeBottomWidth = 9  // Width at the bottom of the wedge
+
+        // Cut the pizza slice wedge from the top of the playable area
+        for y in (BrickwellConstants.towerBaseHeight - wedgeDepth)..<BrickwellConstants.towerBaseHeight {
+            // Calculate wedge width at this row (wider at bottom, narrower at top)
+            let rowFromTop = BrickwellConstants.towerBaseHeight - 1 - y  // 0 at top, wedgeDepth-1 at bottom
+            let progress = Float(wedgeDepth - 1 - rowFromTop) / Float(wedgeDepth - 1)  // 0 at top, 1 at bottom
+            let halfWidth = Int(Float(wedgeTopWidth) / 2.0 + progress * Float(wedgeBottomWidth - wedgeTopWidth) / 2.0)
+
+            // Cut the wedge (remove blocks)
+            for x in (wedgeCenterX - halfWidth)...(wedgeCenterX + halfWidth) {
+                if x >= 0 && x < BrickwellConstants.gridWidth {
+                    cells[y][x] = 0
+                }
             }
         }
 
-        // Initialize gap position at random X on row 0
+        // Initialize gap position at random X on row 0 (outside wedge area)
         gapX = Int.random(in: 0..<BrickwellConstants.gridWidth)
         gapY = 0
         cells[gapY][gapX] = 0
 
-        // Trace wandering gap path up through the tower
-        while gapY < BrickwellConstants.towerBaseHeight - 1 {
+        // Trace wandering gap path up through the tower (stops before wedge)
+        while gapY < BrickwellConstants.towerBaseHeight - wedgeDepth - 1 {
             traceNextGap()
         }
     }
