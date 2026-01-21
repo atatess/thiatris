@@ -164,26 +164,14 @@ class Grid {
         
         let cleared = checkLines()
         var falling: [(x: Int, oldY: Int, newY: Int)] = []
-        
+
         if !cleared.isEmpty {
-            // Apply piece-specific gravity
-            placedCoords.sort { $0.y < $1.y }
-            for coord in placedCoords {
-                if cleared.contains(coord.y) { continue }
-                
-                cells[coord.y][coord.x] = 0
-                var targetY = coord.y
-                while targetY > 0 && cells[targetY - 1][coord.x] == 0 {
-                    targetY -= 1
-                }
-                cells[targetY][coord.x] = 1
-                
-                if targetY != coord.y {
-                    falling.append((coord.x, coord.y, targetY))
-                }
+            // Apply gravity to ALL columns (full circumference)
+            for x in 0..<BrickwellConstants.totalCircumference {
+                falling.append(contentsOf: applyGravityToColumn(x: x, clearedRows: cleared))
             }
         }
-        
+
         return (cleared, falling)
     }
     
@@ -200,12 +188,37 @@ class Grid {
             if full { cleared.append(y) }
         }
         
+        // Clear the ENTIRE row including decorative ring (all 40 columns)
         for y in cleared {
-            for x in 0..<BrickwellConstants.gridWidth {
+            for x in 0..<BrickwellConstants.totalCircumference {
                 cells[y][x] = 0
             }
         }
         return cleared
+    }
+
+    /// Applies gravity to a single column, only affecting blocks above cleared rows
+    /// Each block falls by the number of cleared rows below it
+    private func applyGravityToColumn(x: Int, clearedRows: [Int]) -> [(x: Int, oldY: Int, newY: Int)] {
+        var falling: [(x: Int, oldY: Int, newY: Int)] = []
+        let sortedCleared = clearedRows.sorted()
+        guard let lowestCleared = sortedCleared.first else { return falling }
+
+        // Only process blocks above the lowest cleared row
+        for y in (lowestCleared + 1)..<BrickwellConstants.gridHeight {
+            if cells[y][x] == 1 {
+                // Count how many cleared rows are below this block
+                let clearedBelow = sortedCleared.filter { $0 < y }.count
+                if clearedBelow > 0 {
+                    let newY = y - clearedBelow
+                    cells[y][x] = 0
+                    cells[newY][x] = 1
+                    falling.append((x: x, oldY: y, newY: newY))
+                }
+            }
+        }
+
+        return falling
     }
     
     func riseUp() {
@@ -237,30 +250,37 @@ class BrickwellRenderer: NSObject, SCNSceneRendererDelegate {
     
     var onRiseStep: (() -> Void)?
     
-    init(view: SCNView) {
+    init(view: SCNView, isPreviewMode: Bool = false) {
         self.scene = SCNScene()
         self.cameraNode = SCNNode()
-        
+
         super.init()
-        
-        scene.background.contents = UIColor(red: 0.13, green: 0.13, blue: 0.13, alpha: 1.0)
-        
+
+        // Use clear background for preview mode so SwiftUI background shows through
+        if isPreviewMode {
+            scene.background.contents = UIColor.clear
+            view.backgroundColor = .clear
+        } else {
+            scene.background.contents = UIColor(red: 0.13, green: 0.13, blue: 0.13, alpha: 1.0)
+            view.backgroundColor = .black
+        }
+
         cameraNode.camera = SCNCamera()
         cameraNode.position = SCNVector3(0, 35, 22)
         cameraNode.eulerAngles = SCNVector3(-Float.pi / 6, 0, 0)
         scene.rootNode.addChildNode(cameraNode)
-        
+
         // World setup
         scene.rootNode.addChildNode(worldNode)
         worldNode.addChildNode(fallingGroup)
-        
+
         let ambient = SCNLight()
         ambient.type = .ambient
         ambient.intensity = 400
         let ambientNode = SCNNode()
         ambientNode.light = ambient
         scene.rootNode.addChildNode(ambientNode)
-        
+
         let sun = SCNLight()
         sun.type = .directional
         sun.intensity = 1000
@@ -269,10 +289,9 @@ class BrickwellRenderer: NSObject, SCNSceneRendererDelegate {
         sunNode.position = SCNVector3(10, 50, 20)
         sunNode.look(at: SCNVector3(0, 15, 0))
         scene.rootNode.addChildNode(sunNode)
-        
+
         view.scene = scene
         view.allowsCameraControl = false
-        view.backgroundColor = .black
         view.delegate = self
         view.isPlaying = true
     }
@@ -1159,7 +1178,7 @@ struct BrickwellSceneView: UIViewRepresentable {
 
     func makeUIView(context: Context) -> SCNView {
         let scnView = SCNView()
-        let renderer = BrickwellRenderer(view: scnView)
+        let renderer = BrickwellRenderer(view: scnView, isPreviewMode: isPreviewMode)
 
         // Only set up renderer for the main game instance (not preview)
         if !isPreviewMode {
@@ -1173,7 +1192,7 @@ struct BrickwellSceneView: UIViewRepresentable {
             // Don't auto-start - let the game manager control when to start
             renderer.isRising = false
         } else {
-            // Preview mode - just show a static tower
+            // Preview mode - just show a static tower with clear background
             renderer.isRising = false
         }
 
