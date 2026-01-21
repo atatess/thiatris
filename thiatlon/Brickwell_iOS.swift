@@ -242,17 +242,22 @@ class BrickwellRenderer: NSObject, SCNSceneRendererDelegate {
     var worldNode = SCNNode() // Parent for EVERYTHING that rises
     var blockNodes: [String: SCNNode] = [:]
     var fallingGroup = SCNNode()
-    
+
     // Smooth rising state
     var isRising = true
     private var lastUpdateTime: TimeInterval = 0
     private var fractionalRise: Float = 0
-    
+
+    // Theme support
+    var currentTheme: ThemeType = .elly
+    private var isPreviewModeInternal: Bool = false
+
     var onRiseStep: (() -> Void)?
     
     init(view: SCNView, isPreviewMode: Bool = false) {
         self.scene = SCNScene()
         self.cameraNode = SCNNode()
+        self.isPreviewModeInternal = isPreviewMode
 
         super.init()
 
@@ -261,7 +266,9 @@ class BrickwellRenderer: NSObject, SCNSceneRendererDelegate {
             scene.background.contents = UIColor.clear
             view.backgroundColor = .clear
         } else {
-            scene.background.contents = UIColor(red: 0.13, green: 0.13, blue: 0.13, alpha: 1.0)
+            // Apply theme background (will be updated when theme is set)
+            let themeColors = ThemeColors.colors(for: currentTheme)
+            scene.background.contents = themeColors.sceneBackground
             view.backgroundColor = .black
         }
 
@@ -392,7 +399,8 @@ class BrickwellRenderer: NSObject, SCNSceneRendererDelegate {
     
     private func addBlock(x: Int, y: Int) {
         let key = "\(x),\(y)"
-        let color = x >= BrickwellConstants.gridWidth ? UIColor.gray : UIColor.systemOrange
+        let themeColors = ThemeColors.colors(for: currentTheme)
+        let color = x >= BrickwellConstants.gridWidth ? themeColors.decorativeRingColor : themeColors.blockColor
         let node = createBlockNode(color: color)
         node.position = getPosition(x: x, y: y)
         let angle = (Float(x - 7) / Float(BrickwellConstants.totalCircumference)) * Float.pi * 2
@@ -414,6 +422,36 @@ class BrickwellRenderer: NSObject, SCNSceneRendererDelegate {
         box.materials = [material]
         return SCNNode(geometry: box)
     }
+
+    func setTheme(_ theme: ThemeType) {
+        currentTheme = theme
+        let themeColors = ThemeColors.colors(for: theme)
+
+        // Update scene background (only for non-preview mode)
+        if !isPreviewModeInternal {
+            scene.background.contents = themeColors.sceneBackground
+        }
+
+        // Rebuild all blocks with new colors
+        rebuildAllBlocks()
+    }
+
+    private func rebuildAllBlocks() {
+        let themeColors = ThemeColors.colors(for: currentTheme)
+
+        // Update existing blocks with new colors
+        for (key, node) in blockNodes {
+            let coords = key.split(separator: ",")
+            if coords.count == 2, let x = Int(coords[0]) {
+                let color = x >= BrickwellConstants.gridWidth ? themeColors.decorativeRingColor : themeColors.blockColor
+                if let geometry = node.geometry as? SCNBox {
+                    let material = SCNMaterial()
+                    material.diffuse.contents = color
+                    geometry.materials = [material]
+                }
+            }
+        }
+    }
 }
 
 // MARK: - Design Colors
@@ -427,6 +465,44 @@ struct DesignColors {
     static let scoreGray = Color(red: 117/255, green: 117/255, blue: 117/255)
     static let iconGray = Color(red: 117/255, green: 117/255, blue: 117/255)
     static let backgroundBeige = Color(red: 238/255, green: 232/255, blue: 232/255)
+}
+
+// MARK: - Theme Colors
+struct ThemeColors {
+    let blockColor: UIColor
+    let decorativeRingColor: UIColor
+    let sceneBackground: Any  // UIColor or UIImage
+    let uiTextColor: Color
+    let uiBackgroundColor: Color
+
+    static func colors(for theme: ThemeType) -> ThemeColors {
+        switch theme {
+        case .elly:
+            return ThemeColors(
+                blockColor: .systemOrange,
+                decorativeRingColor: .gray,
+                sceneBackground: UIColor(red: 0.13, green: 0.13, blue: 0.13, alpha: 1.0),
+                uiTextColor: Color(red: 117/255, green: 117/255, blue: 117/255),
+                uiBackgroundColor: Color(red: 238/255, green: 232/255, blue: 232/255)
+            )
+        case .pinky:
+            return ThemeColors(
+                blockColor: UIColor(red: 201/255, green: 144/255, blue: 154/255, alpha: 1.0),
+                decorativeRingColor: UIColor(red: 245/255, green: 240/255, blue: 235/255, alpha: 1.0),
+                sceneBackground: UIColor(red: 208/255, green: 220/255, blue: 248/255, alpha: 1.0),
+                uiTextColor: Color(red: 117/255, green: 117/255, blue: 117/255),
+                uiBackgroundColor: Color(red: 208/255, green: 220/255, blue: 248/255)
+            )
+        case .galaxy:
+            return ThemeColors(
+                blockColor: UIColor(red: 232/255, green: 232/255, blue: 240/255, alpha: 1.0),
+                decorativeRingColor: UIColor(red: 107/255, green: 63/255, blue: 160/255, alpha: 1.0),
+                sceneBackground: UIImage(named: "galaxy_background") ?? UIColor(red: 13/255, green: 13/255, blue: 32/255, alpha: 1.0),
+                uiTextColor: .white,
+                uiBackgroundColor: Color(red: 13/255, green: 13/255, blue: 32/255)
+            )
+        }
+    }
 }
 
 // MARK: - Glassmorphism Panel
@@ -486,21 +562,25 @@ struct DangerButton: View {
 struct ScoreTab: View {
     let label: String
     let value: Int
+    var theme: ThemeType = .elly
 
     var body: some View {
+        let themeColors = ThemeColors.colors(for: theme)
+        let isGalaxy = theme == .galaxy
+
         VStack(alignment: .trailing, spacing: 4) {
             Text(label)
                 .font(.system(size: 12, weight: .medium))
-                .foregroundColor(DesignColors.scoreGray)
+                .foregroundColor(isGalaxy ? themeColors.uiTextColor.opacity(0.7) : DesignColors.scoreGray)
             Text("\(value)")
                 .font(.system(size: 20, weight: .bold, design: .monospaced))
-                .foregroundColor(DesignColors.titleDark)
+                .foregroundColor(isGalaxy ? themeColors.uiTextColor : DesignColors.titleDark)
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
         .background(
             RoundedRectangle(cornerRadius: 12)
-                .fill(.white.opacity(0.9))
+                .fill(isGalaxy ? Color.black.opacity(0.5) : .white.opacity(0.9))
         )
     }
 }
@@ -508,21 +588,24 @@ struct ScoreTab: View {
 // MARK: - Pause Button
 struct PauseButton: View {
     let action: () -> Void
+    var theme: ThemeType = .elly
 
     var body: some View {
+        let isGalaxy = theme == .galaxy
+
         Button(action: action) {
             ZStack {
                 Circle()
-                    .fill(.white.opacity(0.9))
+                    .fill(isGalaxy ? Color.black.opacity(0.5) : .white.opacity(0.9))
                     .frame(width: 50, height: 50)
 
                 HStack(spacing: 4) {
                     Rectangle()
-                        .fill(DesignColors.iconGray)
+                        .fill(isGalaxy ? Color.white : DesignColors.iconGray)
                         .frame(width: 4, height: 18)
                         .cornerRadius(2)
                     Rectangle()
-                        .fill(DesignColors.iconGray)
+                        .fill(isGalaxy ? Color.white : DesignColors.iconGray)
                         .frame(width: 4, height: 18)
                         .cornerRadius(2)
                 }
@@ -755,15 +838,15 @@ struct GameplayView: View {
     }
 
     private var pauseButtonView: some View {
-        PauseButton {
+        PauseButton(action: {
             game.pauseGame()
-        }
+        }, theme: game.settings.theme)
     }
 
     private var scoreTabsView: some View {
         VStack(alignment: .trailing, spacing: 8) {
-            ScoreTab(label: "High Score", value: game.highScore)
-            ScoreTab(label: "Current Score", value: game.score)
+            ScoreTab(label: "High Score", value: game.highScore, theme: game.settings.theme)
+            ScoreTab(label: "Current Score", value: game.score, theme: game.settings.theme)
         }
     }
 }
@@ -877,7 +960,7 @@ struct SettingsView: View {
                                 theme: theme,
                                 isSelected: game.settings.theme == theme
                             ) {
-                                game.settings.theme = theme
+                                game.applyTheme(theme)
                             }
                         }
                     }
@@ -1016,6 +1099,20 @@ class BrickwellGameManager: ObservableObject {
     init() {
         // Load persisted high score
         self.highScore = UserDefaults.standard.integer(forKey: "thiatris_high_score")
+
+        // Load persisted theme
+        if let savedTheme = UserDefaults.standard.string(forKey: "thiatris_theme"),
+           let theme = ThemeType(rawValue: savedTheme) {
+            settings.theme = theme
+        }
+    }
+
+    // MARK: - Theme Management
+
+    func applyTheme(_ theme: ThemeType) {
+        settings.theme = theme
+        UserDefaults.standard.set(theme.rawValue, forKey: "thiatris_theme")
+        renderer?.setTheme(theme)
     }
 
     // MARK: - State Navigation
@@ -1179,6 +1276,9 @@ struct BrickwellSceneView: UIViewRepresentable {
     func makeUIView(context: Context) -> SCNView {
         let scnView = SCNView()
         let renderer = BrickwellRenderer(view: scnView, isPreviewMode: isPreviewMode)
+
+        // Apply the current theme to the renderer
+        renderer.setTheme(game.settings.theme)
 
         // Only set up renderer for the main game instance (not preview)
         if !isPreviewMode {
