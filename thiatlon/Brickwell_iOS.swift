@@ -97,36 +97,83 @@ struct Piece {
 // MARK: - Grid Logic
 class Grid {
     var cells: [[Int]]
-    
+
+    // Gap tracing state
+    private var gapX: Int = 0
+    private var gapY: Int = 0
+
     init() {
         self.cells = Array(repeating: Array(repeating: 0, count: BrickwellConstants.totalCircumference), count: BrickwellConstants.gridHeight)
         preBuildTower()
     }
-    
+
     func preBuildTower() {
-        for y in 0..<BrickwellConstants.gridHeight {
+        // Fill the tower base completely first
+        for y in 0..<BrickwellConstants.towerBaseHeight {
             for x in 0..<BrickwellConstants.totalCircumference {
-                if x >= BrickwellConstants.gridWidth {
-                    cells[y][x] = 1 // Decorative outer ring
-                } else if y < BrickwellConstants.towerBaseHeight {
-                    // "Easily completable" map logic
-                    // Fill mostly, but leave clear vertical gaps
-                    let hole1 = (y * 3 + 2) % BrickwellConstants.gridWidth
-                    let hole2 = (y * 7 + 5) % BrickwellConstants.gridWidth
-                    
-                    var shouldFill = true
-                    if x == hole1 || x == hole2 { shouldFill = false }
-                    
-                    // Add some random noise for "ruined" look
-                    if Float.random(in: 0...1) > 0.9 { shouldFill = false }
-                    
-                    // Don't fill if it's a hole
-                    if shouldFill {
-                        cells[y][x] = 1
-                    }
-                }
+                cells[y][x] = 1
             }
         }
+
+        // Fill decorative ring for rows above tower base
+        for y in BrickwellConstants.towerBaseHeight..<BrickwellConstants.gridHeight {
+            for x in BrickwellConstants.gridWidth..<BrickwellConstants.totalCircumference {
+                cells[y][x] = 1
+            }
+        }
+
+        // Initialize gap position at random X on row 0
+        gapX = Int.random(in: 0..<BrickwellConstants.gridWidth)
+        gapY = 0
+        cells[gapY][gapX] = 0
+
+        // Trace wandering gap path up through the tower
+        while gapY < BrickwellConstants.towerBaseHeight - 1 {
+            traceNextGap()
+        }
+    }
+
+    private func traceNextGap() {
+        var pUp = 0.5
+        var pUpLeft = 0.1
+        var pUpRight = 0.1
+        var pLeft = 0.15
+        var pRight = 0.15
+
+        // Boundary logic - redistribute probability when at edges
+        if gapX == 0 {
+            pRight += pLeft
+            pLeft = 0
+            pUpRight += pUpLeft
+            pUpLeft = 0
+        } else if gapX == BrickwellConstants.gridWidth - 1 {
+            pLeft += pRight
+            pRight = 0
+            pUpLeft += pUpRight
+            pUpRight = 0
+        }
+
+        let roll = Float.random(in: 0...1)
+        var cumulative: Float = 0
+
+        // Determine move based on probability distribution
+        if roll < (cumulative + Float(pUp)) {
+            gapY += 1
+        } else if roll < (cumulative + Float(pUp) + Float(pUpLeft)) {
+            gapY += 1; gapX -= 1
+        } else if roll < (cumulative + Float(pUp) + Float(pUpLeft) + Float(pUpRight)) {
+            gapY += 1; gapX += 1
+        } else if roll < (cumulative + Float(pUp) + Float(pUpLeft) + Float(pUpRight) + Float(pLeft)) {
+            gapX -= 1
+        } else {
+            gapX += 1
+        }
+
+        // Clamp Y to grid height and X to playable width (defensive)
+        gapY = min(gapY, BrickwellConstants.gridHeight - 1)
+        gapX = max(0, min(gapX, BrickwellConstants.gridWidth - 1))
+
+        cells[gapY][gapX] = 0
     }
     
     func isValid(shape: [[Int]], x: Int, y: Int) -> Bool {
