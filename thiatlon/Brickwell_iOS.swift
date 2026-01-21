@@ -284,15 +284,27 @@ class Grid {
     
     func riseUp() {
         cells.removeLast()
-        var newRow = Array(repeating: 0, count: BrickwellConstants.totalCircumference)
-        for x in 0..<BrickwellConstants.totalCircumference {
-            if x >= BrickwellConstants.gridWidth {
-                newRow[x] = 1
-            } else if Float.random(in: 0...1) > 0.15 {
-                newRow[x] = 1
-            }
-        }
+
+        // Insert new filled row at the bottom
+        var newRow = Array(repeating: 1, count: BrickwellConstants.totalCircumference)
         cells.insert(newRow, at: 0)
+
+        // Adjust gapY for the shift (everything moved up by 1)
+        gapY += 1
+        if gapY >= BrickwellConstants.gridHeight {
+            gapY = BrickwellConstants.gridHeight - 1
+        }
+
+        // Trace a new gap for the bottom row to maintain continuous path
+        // Find the gap at row 1 and decide where it goes for row 0
+        if let xAtRow1 = (0..<BrickwellConstants.gridWidth).first(where: { cells[1][$0] == 0 }) {
+            // Random walk from row 1 to row 0
+            let move = Int.random(in: -1...1)
+            var xAtRow0 = xAtRow1 + move
+            // Clamp to playable width
+            xAtRow0 = max(0, min(xAtRow0, BrickwellConstants.gridWidth - 1))
+            cells[0][xAtRow0] = 0
+        }
     }
 }
 
@@ -1313,7 +1325,15 @@ class BrickwellGameManager: ObservableObject {
         self.grid.riseUp()
         self.renderer?.updateGrid(grid: self.grid, clearedRows: [], fallingPieces: [])
 
-        // Check collision after rise
+        // Check if tower reached the top of the screen (game over)
+        for x in 0..<BrickwellConstants.gridWidth {
+            if self.grid.cells[BrickwellConstants.gridHeight - 1][x] != 0 {
+                triggerGameOver()
+                return
+            }
+        }
+
+        // Check collision with falling piece after rise
         if !self.grid.isValid(shape: self.currentPiece.shape, x: self.currentPiece.x, y: self.currentPiece.y) {
             triggerGameOver()
             return
@@ -1350,8 +1370,8 @@ struct BrickwellSceneView: UIViewRepresentable {
                 game.riseStep()
             }
 
-            // Don't auto-start - let the game manager control when to start
-            renderer.isRising = false
+            // Set rising based on current game state
+            renderer.isRising = (game.gameState == .playing)
         } else {
             // Preview mode - just show a static tower with clear background
             renderer.isRising = false
