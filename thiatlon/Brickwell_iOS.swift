@@ -30,12 +30,12 @@ struct GameSettings {
 // MARK: - Constants
 struct BrickwellConstants {
     static let gridWidth = 15
-    static let totalCircumference = 40
-    static let gridHeight = 30
-    static let towerBaseHeight = 20
-    static let cylinderRadius: Float = 6.366
+    static let totalCircumference = 50
+    static let gridHeight = 60
+    static let towerBaseHeight = 35
+    static let cylinderRadius: Float = 50.0 / (2.0 * Float.pi) // approx 7.95
     static let fallAnimationDuration: TimeInterval = 0.4
-    static let riseSpeed: Float = 0.5 // Blocks per second
+    static let riseSpeed: Float = 1.0 / 9.0 // Rise every 9 seconds
 }
 
 // MARK: - Tetromino Definitions
@@ -78,7 +78,7 @@ struct Piece {
         self.type = type
         self.shape = type.shape
         self.x = (BrickwellConstants.gridWidth / 2) - (shape[0].count / 2)
-        self.y = BrickwellConstants.gridHeight - 2
+        self.y = BrickwellConstants.gridHeight - 3
     }
     
     mutating func rotate() -> [[Int]] {
@@ -108,7 +108,7 @@ class Grid {
     }
 
     func preBuildTower() {
-        // Fill the entire tower (both playable and decorative) to the same height
+        // Fill the initial tower (both playable and decorative) up to the base height
         for y in 0..<BrickwellConstants.towerBaseHeight {
             for x in 0..<BrickwellConstants.totalCircumference {
                 cells[y][x] = 1
@@ -148,11 +148,11 @@ class Grid {
     }
 
     private func traceNextGap() {
-        var pUp = 0.5
-        var pUpLeft = 0.1
-        var pUpRight = 0.1
-        var pLeft = 0.15
-        var pRight = 0.15
+        let pUp: Float = 0.5
+        var pUpLeft: Float = 0.1
+        var pUpRight: Float = 0.1
+        var pLeft: Float = 0.15
+        var pRight: Float = 0.15
 
         // Boundary logic - redistribute probability when at edges
         if gapX == 0 {
@@ -168,19 +168,36 @@ class Grid {
         }
 
         let roll = Float.random(in: 0...1)
-        var cumulative: Float = 0
-
-        // Determine move based on probability distribution
-        if roll < (cumulative + Float(pUp)) {
-            gapY += 1
-        } else if roll < (cumulative + Float(pUp) + Float(pUpLeft)) {
-            gapY += 1; gapX -= 1
-        } else if roll < (cumulative + Float(pUp) + Float(pUpLeft) + Float(pUpRight)) {
-            gapY += 1; gapX += 1
-        } else if roll < (cumulative + Float(pUp) + Float(pUpLeft) + Float(pUpRight) + Float(pLeft)) {
-            gapX -= 1
+        
+        // Centering force: Bias move towards the middle (7)
+        let middleX = Float(BrickwellConstants.gridWidth) / 2.0
+        let distFromCenter = Float(gapX) - middleX
+        let centeringBias: Float = 0.15 // Chance to move towards center if away
+        
+        var moveX = 0
+        if roll < (centeringBias * (distFromCenter < 0 ? 1 : 0)) {
+            moveX = 1 // Move right towards center
+        } else if roll < (centeringBias * (distFromCenter > 0 ? 1 : 0)) + (distFromCenter < 0 ? centeringBias : 0) {
+            moveX = -1 // Move left towards center
         } else {
-            gapX += 1
+            // Normal random walk
+            let walkRoll = Float.random(in: 0...1)
+            if walkRoll < (pUp) {
+                gapY += 1
+            } else if walkRoll < (pUp + pUpLeft) {
+                gapY += 1; gapX -= 1
+            } else if walkRoll < (pUp + pUpLeft + pUpRight) {
+                gapY += 1; gapX += 1
+            } else if walkRoll < (pUp + pUpLeft + pUpRight + pLeft) {
+                gapX -= 1
+            } else {
+                gapX += 1
+            }
+        }
+        
+        if moveX != 0 {
+            // Apply centering move
+            gapX += moveX
         }
 
         // Clamp Y to grid height and X to playable width (defensive)
@@ -218,6 +235,11 @@ class Grid {
                     if ny < BrickwellConstants.gridHeight {
                         cells[ny][nx] = 1
                         placedCoords.append((nx, ny))
+                        
+                        // Dynamically fill the decorative ring for any row reached by the piece
+                        for rx in BrickwellConstants.gridWidth..<BrickwellConstants.totalCircumference {
+                            cells[ny][rx] = 1
+                        }
                     }
                 }
             }
@@ -227,7 +249,7 @@ class Grid {
         var falling: [(x: Int, oldY: Int, newY: Int)] = []
 
         if !cleared.isEmpty {
-            // Apply gravity to ALL columns (full circumference)
+            // Apply gravity to the entire circumference (playable + decorative)
             for x in 0..<BrickwellConstants.totalCircumference {
                 falling.append(contentsOf: applyGravityToColumn(x: x, clearedRows: cleared))
             }
@@ -249,7 +271,7 @@ class Grid {
             if full { cleared.append(y) }
         }
         
-        // Clear the ENTIRE row including decorative ring (all 40 columns)
+        // Clear the entire row including decorative ring as requested
         for y in cleared {
             for x in 0..<BrickwellConstants.totalCircumference {
                 cells[y][x] = 0
@@ -285,8 +307,8 @@ class Grid {
     func riseUp() {
         cells.removeLast()
 
-        // Insert new filled row at the bottom
-        var newRow = Array(repeating: 1, count: BrickwellConstants.totalCircumference)
+        // Insert new full row (playable + decorative)
+        let newRow = Array(repeating: 1, count: BrickwellConstants.totalCircumference)
         cells.insert(newRow, at: 0)
 
         // Adjust gapY for the shift (everything moved up by 1)
@@ -295,12 +317,25 @@ class Grid {
             gapY = BrickwellConstants.gridHeight - 1
         }
 
-        // Trace a new gap for the bottom row to maintain continuous path
-        // Find the gap at row 1 and decide where it goes for row 0
+        // Trace a new gap for the bottom row to maintain continuous structure
+        // Look at row 1 to see where the gap was
         if let xAtRow1 = (0..<BrickwellConstants.gridWidth).first(where: { cells[1][$0] == 0 }) {
-            // Random walk from row 1 to row 0
-            let move = Int.random(in: -1...1)
-            var xAtRow0 = xAtRow1 + move
+            let middleX = Float(BrickwellConstants.gridWidth) / 2.0
+            let distFromCenter = Float(xAtRow1) - middleX
+            let centeringBias: Float = 0.15 // Chance to move towards center if away
+            
+            let roll = Float.random(in: 0...1)
+            var moveX = 0
+            
+            if roll < (centeringBias * (distFromCenter < 0 ? 1 : 0)) {
+                moveX = 1 // Move right towards center
+            } else if roll < (centeringBias * (distFromCenter > 0 ? 1 : 0)) + (distFromCenter < 0 ? centeringBias : 0) {
+                moveX = -1 // Move left towards center
+            } else {
+                moveX = Int.random(in: -1...1) // Normal random walk
+            }
+            
+            var xAtRow0 = xAtRow1 + moveX
             // Clamp to playable width
             xAtRow0 = max(0, min(xAtRow0, BrickwellConstants.gridWidth - 1))
             cells[0][xAtRow0] = 0
@@ -315,6 +350,8 @@ class BrickwellRenderer: NSObject, SCNSceneRendererDelegate {
     var worldNode = SCNNode() // Parent for EVERYTHING that rises
     var blockNodes: [String: SCNNode] = [:]
     var fallingGroup = SCNNode()
+    private var fallingNodes: [SCNNode] = []
+    private var ghostNodes: [SCNNode] = []
 
     // Smooth rising state
     var isRising = true
@@ -346,9 +383,22 @@ class BrickwellRenderer: NSObject, SCNSceneRendererDelegate {
         }
 
         cameraNode.camera = SCNCamera()
-        cameraNode.position = SCNVector3(0, 35, 22)
-        cameraNode.eulerAngles = SCNVector3(-Float.pi / 6, 0, 0)
+        cameraNode.position = SCNVector3(0, 52, 42)
+        cameraNode.look(at: SCNVector3(0, 43.5, 0)) // ~10 degree tilt
         scene.rootNode.addChildNode(cameraNode)
+        
+        // Pre-allocate nodes for falling and ghost pieces
+        for _ in 0..<16 {
+            let fNode = createBlockNode(color: .white)
+            fNode.isHidden = true
+            fallingGroup.addChildNode(fNode)
+            fallingNodes.append(fNode)
+            
+            let gNode = createBlockNode(color: .green)
+            gNode.isHidden = true
+            fallingGroup.addChildNode(gNode)
+            ghostNodes.append(gNode)
+        }
 
         // World setup
         scene.rootNode.addChildNode(worldNode)
@@ -391,14 +441,12 @@ class BrickwellRenderer: NSObject, SCNSceneRendererDelegate {
                 }
             }
             
-            // Move the entire world in one shot
             SCNTransaction.begin()
             SCNTransaction.animationDuration = 0
             worldNode.position.y = fractionalRise
             SCNTransaction.commit()
         }
     }
-
     func getPosition(x: Int, y: Int, yOffset: Float = 0) -> SCNVector3 {
         let angle = (Float(x - 7) / Float(BrickwellConstants.totalCircumference)) * Float.pi * 2
         let px = sin(angle) * BrickwellConstants.cylinderRadius
@@ -406,6 +454,7 @@ class BrickwellRenderer: NSObject, SCNSceneRendererDelegate {
         let py = Float(y) + yOffset
         return SCNVector3(px, py, pz)
     }
+
     
     // ... (updateGrid, renderFallingPiece, addBlock, removeBlock, createBlockNode, syncAllPositions same as before)
     
@@ -452,19 +501,52 @@ class BrickwellRenderer: NSObject, SCNSceneRendererDelegate {
         }
     }
     
-    func renderFallingPiece(piece: Piece) {
-        fallingGroup.enumerateChildNodes { (node, _) in node.removeFromParentNode() }
+    func renderFallingPiece(piece: Piece, grid: Grid, ghostY: Int? = nil) {
+        // Hide all nodes first
+        fallingNodes.forEach { $0.isHidden = true }
+        ghostNodes.forEach { $0.isHidden = true }
         
+        // Remove old preview rings from fallingGroup (they were added on the fly)
+        fallingGroup.enumerateChildNodes { (node, _) in
+            if node.name == "preview_ring" {
+                node.removeFromParentNode()
+            }
+        }
+        
+        var fIdx = 0
+        var gIdx = 0
+        
+        // Render Ghost Piece (Green highlight)
+        if let gy = ghostY {
+            let ghostColor = UIColor.systemGreen.withAlphaComponent(0.7)
+            for r in 0..<piece.shape.count {
+                for c in 0..<piece.shape[r].count {
+                    if piece.shape[r][c] != 0 && gIdx < ghostNodes.count {
+                        let x = piece.x + c
+                        let y = gy + r
+                        let node = ghostNodes[gIdx]
+                        node.isHidden = false
+                        node.geometry?.firstMaterial?.diffuse.contents = ghostColor
+                        node.position = getPosition(x: x, y: y)
+                        node.eulerAngles.y = (Float(x - 7) / Float(BrickwellConstants.totalCircumference)) * Float.pi * 2
+                        gIdx += 1
+                    }
+                }
+            }
+        }
+
+        // Render Actual Piece
         for r in 0..<piece.shape.count {
             for c in 0..<piece.shape[r].count {
-                if piece.shape[r][c] != 0 {
+                if piece.shape[r][c] != 0 && fIdx < fallingNodes.count {
                     let x = piece.x + c
                     let y = piece.y + r
-                    let node = createBlockNode(color: piece.type.color)
+                    let node = fallingNodes[fIdx]
+                    node.isHidden = false
+                    node.geometry?.firstMaterial?.diffuse.contents = piece.type.color
                     node.position = getPosition(x: x, y: y)
-                    let angle = (Float(x - 7) / Float(BrickwellConstants.totalCircumference)) * Float.pi * 2
-                    node.eulerAngles.y = angle
-                    fallingGroup.addChildNode(node)
+                    node.eulerAngles.y = (Float(x - 7) / Float(BrickwellConstants.totalCircumference)) * Float.pi * 2
+                    fIdx += 1
                 }
             }
         }
@@ -1164,7 +1246,8 @@ class BrickwellGameManager: ObservableObject {
     @Published var settings = GameSettings()
 
     var grid = Grid()
-    var currentPiece = Piece(type: TetrominoType.allCases.randomElement()!)
+    var pieceBag: [TetrominoType] = []
+    var currentPiece = Piece(type: .I) // Placeholder, set in startGame
     var renderer: BrickwellRenderer?
 
     private var timer: Timer?
@@ -1194,9 +1277,10 @@ class BrickwellGameManager: ObservableObject {
         // Reset game state for new game
         grid = Grid()
         score = 0
-        currentPiece = Piece(type: TetrominoType.allCases.randomElement()!)
+        pieceBag = []
+        currentPiece = Piece(type: getNextPiece())
         renderer?.updateGrid(grid: grid, clearedRows: [], fallingPieces: [])
-        renderer?.renderFallingPiece(piece: currentPiece)
+        renderer?.renderFallingPiece(piece: currentPiece, grid: grid, ghostY: getGhostY())
         renderer?.isRising = true
 
         // Start game loop
@@ -1274,7 +1358,7 @@ class BrickwellGameManager: ObservableObject {
         guard gameState == .playing else { return }
         if grid.isValid(shape: currentPiece.shape, x: currentPiece.x, y: currentPiece.y - 1) {
             currentPiece.y -= 1
-            renderer?.renderFallingPiece(piece: currentPiece)
+            renderer?.renderFallingPiece(piece: currentPiece, grid: grid, ghostY: getGhostY())
         } else {
             lock()
         }
@@ -1284,7 +1368,7 @@ class BrickwellGameManager: ObservableObject {
         guard gameState == .playing else { return }
         if grid.isValid(shape: currentPiece.shape, x: currentPiece.x + dir, y: currentPiece.y) {
             currentPiece.x += dir
-            renderer?.renderFallingPiece(piece: currentPiece)
+            renderer?.renderFallingPiece(piece: currentPiece, grid: grid, ghostY: getGhostY())
         }
     }
 
@@ -1294,7 +1378,7 @@ class BrickwellGameManager: ObservableObject {
         temp.shape = temp.rotate()
         if grid.isValid(shape: temp.shape, x: temp.x, y: temp.y) {
             currentPiece = temp
-            renderer?.renderFallingPiece(piece: currentPiece)
+            renderer?.renderFallingPiece(piece: currentPiece, grid: grid, ghostY: getGhostY())
         }
     }
 
@@ -1311,12 +1395,12 @@ class BrickwellGameManager: ObservableObject {
         score += result.clearedRows.count * 100
         renderer?.updateGrid(grid: grid, clearedRows: result.clearedRows, fallingPieces: result.fallingBlocks)
 
-        currentPiece = Piece(type: TetrominoType.allCases.randomElement()!)
+        currentPiece = Piece(type: getNextPiece())
         if !grid.isValid(shape: currentPiece.shape, x: currentPiece.x, y: currentPiece.y) {
             triggerGameOver()
             return
         }
-        renderer?.renderFallingPiece(piece: currentPiece)
+        renderer?.renderFallingPiece(piece: currentPiece, grid: grid, ghostY: getGhostY())
     }
 
     func riseStep() {
@@ -1340,7 +1424,22 @@ class BrickwellGameManager: ObservableObject {
         }
 
         // Also need to update falling piece visual Y
-        self.renderer?.renderFallingPiece(piece: self.currentPiece)
+        self.renderer?.renderFallingPiece(piece: self.currentPiece, grid: self.grid, ghostY: getGhostY())
+    }
+
+    func getGhostY() -> Int {
+        var gy = currentPiece.y
+        while grid.isValid(shape: currentPiece.shape, x: currentPiece.x, y: gy - 1) {
+            gy -= 1
+        }
+        return gy
+    }
+
+    private func getNextPiece() -> TetrominoType {
+        if pieceBag.isEmpty {
+            pieceBag = TetrominoType.allCases.shuffled()
+        }
+        return pieceBag.removeFirst()
     }
 
     func reset() {
@@ -1380,7 +1479,7 @@ struct BrickwellSceneView: UIViewRepresentable {
         renderer.updateGrid(grid: game.grid, clearedRows: [], fallingPieces: [])
 
         if !isPreviewMode {
-            renderer.renderFallingPiece(piece: game.currentPiece)
+            renderer.renderFallingPiece(piece: game.currentPiece, grid: game.grid, ghostY: game.getGhostY())
         }
 
         return scnView
