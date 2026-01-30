@@ -54,16 +54,20 @@ User Gestures → GameplayView → BrickwellGameManager → Grid/Piece → Brick
 
 ## Key Game Mechanics
 
-**Cylindrical Board**: Grid width 15 (playable), height 30, total circumference 40 cells (15 playable + 25 decorative background ring)
+**Cylindrical Board**: Grid width 15 (playable), height 60, total circumference 50 cells (15 playable + 35 decorative background ring)
 
-**Tower Rising**: Board rises at 0.5 blocks/second via render loop callback. Game ends when rising tower collides with falling piece.
+**Pre-built Tower**: Game starts with a tower built up to row 35, featuring:
+- Pizza slice wedge cut at top (8 rows deep, expanding from 3 to 9 blocks wide) creates the gameplay opening
+- Wandering gap pattern traced through the tower for line-clearing opportunities
 
-**Piece Gravity**: When lines clear, only the placed piece's remaining blocks fall (not entire rows above), creating strategic gameplay.
+**Tower Rising**: Board rises every 9 seconds (0.11 blocks/second) via render loop callback. Game ends when rising tower collides with falling piece or reaches top.
+
+**Line Clearing & Gravity**: When lines clear, all blocks above fall down by the number of cleared rows (affects entire circumference including decorative ring).
 
 ## Persistence
 
 - High score: `UserDefaults` key `"thiatris_high_score"`
-- Settings: Currently in-memory only (theme selection visual but not applied)
+- Theme: `UserDefaults` key `"thiatris_theme"` (persists selected theme across sessions)
 
 ## Design System
 
@@ -71,5 +75,12 @@ Colors defined in `DesignColors` struct match Figma specifications:
 - Golden (buttons): `rgb(213, 171, 68)`
 - Danger red: `rgb(236, 34, 31)`
 - Background beige: `rgb(238, 232, 232)`
+
+**Theme System** (`ThemeColors` struct): Three themes with distinct visual styles:
+- **Elly** (default): Orange blocks, gray decorative ring, dark background
+- **Pinky**: Pink blocks, cream decorative ring, light blue background
+- **Galaxy**: Light gray blocks, purple decorative ring, space image background (falls back to dark purple)
+
+Each theme defines: `blockColor`, `decorativeRingColor`, `sceneBackground`, `uiTextColor`, `uiBackgroundColor`
 
 Hand preference (`isLeftHanded`) swaps pause button and score tabs positions in HUD.

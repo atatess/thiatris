@@ -2,6 +2,8 @@ import Foundation
 import SceneKit
 import SwiftUI
 import Combine
+import AVFoundation
+import CoreHaptics
 
 // MARK: - Game State
 enum GameState: Equatable {
@@ -27,6 +29,29 @@ struct GameSettings {
     var isLeftHanded: Bool = false  // false = right-handed (default)
 }
 
+// MARK: - Game Stats
+struct GameStats: Codable {
+    var totalLinesCleared: Int = 0
+    var gamesPlayed: Int = 0
+    var bestCombo: Int = 0
+
+    static let key = "thiatris_stats"
+
+    static func load() -> GameStats {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let stats = try? JSONDecoder().decode(GameStats.self, from: data) else {
+            return GameStats()
+        }
+        return stats
+    }
+
+    func save() {
+        if let data = try? JSONEncoder().encode(self) {
+            UserDefaults.standard.set(data, forKey: GameStats.key)
+        }
+    }
+}
+
 // MARK: - Constants
 struct BrickwellConstants {
     static let gridWidth = 15
@@ -35,7 +60,329 @@ struct BrickwellConstants {
     static let towerBaseHeight = 35
     static let cylinderRadius: Float = 50.0 / (2.0 * Float.pi) // approx 7.95
     static let fallAnimationDuration: TimeInterval = 0.4
-    static let riseSpeed: Float = 1.0 / 9.0 // Rise every 9 seconds
+    static let baseRiseInterval: Float = 9.0
+    static let riseSpeed: Float = 1.0 / baseRiseInterval // Base rise speed
+}
+
+// MARK: - Score Values
+struct ScoreValues {
+    static let single = 100
+    static let double = 300
+    static let triple = 500
+    static let tetris = 800
+    static let softDropPerCell = 1
+    static let hardDropPerCell = 2
+    static let comboMultipliers: [Double] = [1.0, 1.5, 2.0, 2.5, 3.0]
+
+    static func scoreFor(linesCleared: Int) -> Int {
+        switch linesCleared {
+        case 1: return single
+        case 2: return double
+        case 3: return triple
+        case 4: return tetris
+        default: return linesCleared * single
+        }
+    }
+
+    static func comboMultiplier(for combo: Int) -> Double {
+        let index = min(combo, comboMultipliers.count - 1)
+        return comboMultipliers[max(0, index)]
+    }
+}
+
+// MARK: - Input State
+struct InputState {
+    var isMovingLeft = false
+    var isMovingRight = false
+    var isSoftDropping = false
+    var moveStartTime: Date? = nil
+    var lastMoveTime: Date? = nil
+}
+
+// MARK: - Input Constants
+struct InputConstants {
+    static let dasDelay: TimeInterval = 0.17      // 170ms before auto-repeat starts
+    static let arrInterval: TimeInterval = 0.05   // 50ms between auto-repeat moves
+    static let softDropInterval: TimeInterval = 0.05  // 20x faster than normal fall
+}
+
+// MARK: - Lock Delay Constants
+struct LockDelayConstants {
+    static let lockDelay: TimeInterval = 0.5     // 500ms before piece locks
+    static let maxLockResets: Int = 15           // Prevent infinite stalling
+}
+
+// MARK: - Wave Type
+enum WaveType {
+    case sine
+    case square
+    case sawtooth
+}
+
+// MARK: - Synthesized Audio Manager
+class SynthAudioManager {
+    static let shared = SynthAudioManager()
+
+    private let engine = AVAudioEngine()
+    private var sfxEnabled = true
+    private var musicEnabled = true
+
+    private let sampleRate: Double = 44100.0
+
+    private init() {
+        setupEngine()
+    }
+
+    private func setupEngine() {
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.ambient, mode: .default, options: [.mixWithOthers])
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch {
+            print("Audio session setup failed: \(error)")
+        }
+    }
+
+    func setSFXEnabled(_ enabled: Bool) {
+        sfxEnabled = enabled
+    }
+
+    func setMusicEnabled(_ enabled: Bool) {
+        musicEnabled = enabled
+    }
+
+    private func generateBuffer(frequency: Float, duration: Float, waveType: WaveType, volume: Float = 0.3) -> AVAudioPCMBuffer? {
+        let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1)!
+        let frameCount = AVAudioFrameCount(sampleRate * Double(duration))
+
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return nil }
+        buffer.frameLength = frameCount
+
+        let data = buffer.floatChannelData![0]
+        let angularFrequency = 2.0 * Float.pi * frequency / Float(sampleRate)
+
+        for frame in 0..<Int(frameCount) {
+            let phase = angularFrequency * Float(frame)
+            let envelope = 1.0 - (Float(frame) / Float(frameCount)) // Linear decay
+
+            var sample: Float
+            switch waveType {
+            case .sine:
+                sample = sin(phase)
+            case .square:
+                sample = sin(phase) > 0 ? 1.0 : -1.0
+            case .sawtooth:
+                let t = phase.truncatingRemainder(dividingBy: 2.0 * Float.pi) / (2.0 * Float.pi)
+                sample = 2.0 * t - 1.0
+            }
+
+            data[frame] = sample * volume * envelope
+        }
+
+        return buffer
+    }
+
+    private func generateSweepBuffer(startFreq: Float, endFreq: Float, duration: Float, waveType: WaveType, volume: Float = 0.3) -> AVAudioPCMBuffer? {
+        let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1)!
+        let frameCount = AVAudioFrameCount(sampleRate * Double(duration))
+
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return nil }
+        buffer.frameLength = frameCount
+
+        let data = buffer.floatChannelData![0]
+
+        var phase: Float = 0
+        for frame in 0..<Int(frameCount) {
+            let progress = Float(frame) / Float(frameCount)
+            let currentFreq = startFreq + (endFreq - startFreq) * progress
+            let phaseIncrement = 2.0 * Float.pi * currentFreq / Float(sampleRate)
+            phase += phaseIncrement
+
+            let envelope = 1.0 - progress // Linear decay
+
+            var sample: Float
+            switch waveType {
+            case .sine:
+                sample = sin(phase)
+            case .square:
+                sample = sin(phase) > 0 ? 1.0 : -1.0
+            case .sawtooth:
+                let t = phase.truncatingRemainder(dividingBy: 2.0 * Float.pi) / (2.0 * Float.pi)
+                sample = 2.0 * t - 1.0
+            }
+
+            data[frame] = sample * volume * envelope
+        }
+
+        return buffer
+    }
+
+    private func generateArpeggioBuffer(frequencies: [Float], noteDuration: Float, volume: Float = 0.3) -> AVAudioPCMBuffer? {
+        let totalDuration = noteDuration * Float(frequencies.count)
+        let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1)!
+        let frameCount = AVAudioFrameCount(sampleRate * Double(totalDuration))
+
+        guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else { return nil }
+        buffer.frameLength = frameCount
+
+        let data = buffer.floatChannelData![0]
+        let framesPerNote = Int(sampleRate * Double(noteDuration))
+
+        for (noteIndex, freq) in frequencies.enumerated() {
+            let startFrame = noteIndex * framesPerNote
+            let angularFrequency = 2.0 * Float.pi * freq / Float(sampleRate)
+
+            for i in 0..<framesPerNote {
+                let frame = startFrame + i
+                if frame < Int(frameCount) {
+                    let phase = angularFrequency * Float(i)
+                    let noteProgress = Float(i) / Float(framesPerNote)
+                    let envelope = 1.0 - noteProgress // Decay per note
+                    data[frame] = sin(phase) * volume * envelope
+                }
+            }
+        }
+
+        return buffer
+    }
+
+    private func playBuffer(_ buffer: AVAudioPCMBuffer?) {
+        guard sfxEnabled, let buffer = buffer else { return }
+
+        DispatchQueue.global(qos: .userInteractive).async {
+            do {
+                let playerNode = AVAudioPlayerNode()
+                self.engine.attach(playerNode)
+                self.engine.connect(playerNode, to: self.engine.mainMixerNode, format: buffer.format)
+
+                if !self.engine.isRunning {
+                    try self.engine.start()
+                }
+
+                playerNode.scheduleBuffer(buffer) {
+                    DispatchQueue.main.async {
+                        self.engine.detach(playerNode)
+                    }
+                }
+                playerNode.play()
+            } catch {
+                print("Audio playback failed: \(error)")
+            }
+        }
+    }
+
+    // MARK: - Sound Effects
+
+    func playMove() {
+        // Quick high blip
+        let buffer = generateBuffer(frequency: 800, duration: 0.05, waveType: .square, volume: 0.15)
+        playBuffer(buffer)
+    }
+
+    func playRotate() {
+        // Sweep up
+        let buffer = generateSweepBuffer(startFreq: 400, endFreq: 700, duration: 0.08, waveType: .sine, volume: 0.2)
+        playBuffer(buffer)
+    }
+
+    func playLand() {
+        // Low thud
+        let buffer = generateBuffer(frequency: 120, duration: 0.12, waveType: .sine, volume: 0.25)
+        playBuffer(buffer)
+    }
+
+    func playClear(lines: Int) {
+        switch lines {
+        case 1:
+            // Single line - simple chime
+            let buffer = generateBuffer(frequency: 600, duration: 0.15, waveType: .sine, volume: 0.25)
+            playBuffer(buffer)
+        case 2:
+            // Double - two-note
+            let buffer = generateArpeggioBuffer(frequencies: [500, 700], noteDuration: 0.1, volume: 0.25)
+            playBuffer(buffer)
+        case 3:
+            // Triple - three-note ascending
+            let buffer = generateArpeggioBuffer(frequencies: [500, 650, 800], noteDuration: 0.08, volume: 0.25)
+            playBuffer(buffer)
+        default:
+            // Tetris! - full arpeggio C-E-G-C
+            playTetris()
+        }
+    }
+
+    func playTetris() {
+        // C4-E4-G4-C5 arpeggio
+        let frequencies: [Float] = [261.63, 329.63, 392.00, 523.25]
+        let buffer = generateArpeggioBuffer(frequencies: frequencies, noteDuration: 0.1, volume: 0.3)
+        playBuffer(buffer)
+    }
+
+    func playCombo(level: Int) {
+        // Rising tone based on combo level
+        let baseFreq: Float = 400 + Float(level) * 100
+        let buffer = generateSweepBuffer(startFreq: baseFreq, endFreq: baseFreq + 200, duration: 0.15, waveType: .sine, volume: 0.25)
+        playBuffer(buffer)
+    }
+
+    func playHold() {
+        // Quick swap sound - two alternating tones
+        let buffer = generateArpeggioBuffer(frequencies: [500, 400], noteDuration: 0.05, volume: 0.2)
+        playBuffer(buffer)
+    }
+
+    func playGameOver() {
+        // Descending tone
+        let buffer = generateSweepBuffer(startFreq: 400, endFreq: 100, duration: 0.5, waveType: .sine, volume: 0.3)
+        playBuffer(buffer)
+    }
+}
+
+// MARK: - Haptic Manager
+class HapticManager {
+    static let shared = HapticManager()
+
+    private var lightGenerator: UIImpactFeedbackGenerator?
+    private var mediumGenerator: UIImpactFeedbackGenerator?
+    private var heavyGenerator: UIImpactFeedbackGenerator?
+    private var notificationGenerator: UINotificationFeedbackGenerator?
+
+    private init() {
+        lightGenerator = UIImpactFeedbackGenerator(style: .light)
+        mediumGenerator = UIImpactFeedbackGenerator(style: .medium)
+        heavyGenerator = UIImpactFeedbackGenerator(style: .heavy)
+        notificationGenerator = UINotificationFeedbackGenerator()
+
+        // Prepare generators for faster response
+        lightGenerator?.prepare()
+        mediumGenerator?.prepare()
+        heavyGenerator?.prepare()
+        notificationGenerator?.prepare()
+    }
+
+    static func light() {
+        shared.lightGenerator?.impactOccurred()
+        shared.lightGenerator?.prepare()
+    }
+
+    static func medium() {
+        shared.mediumGenerator?.impactOccurred()
+        shared.mediumGenerator?.prepare()
+    }
+
+    static func heavy() {
+        shared.heavyGenerator?.impactOccurred()
+        shared.heavyGenerator?.prepare()
+    }
+
+    static func success() {
+        shared.notificationGenerator?.notificationOccurred(.success)
+        shared.notificationGenerator?.prepare()
+    }
+
+    static func error() {
+        shared.notificationGenerator?.notificationOccurred(.error)
+        shared.notificationGenerator?.prepare()
+    }
 }
 
 // MARK: - Tetromino Definitions
@@ -363,6 +710,7 @@ class BrickwellRenderer: NSObject, SCNSceneRendererDelegate {
     private var isPreviewModeInternal: Bool = false
 
     var onRiseStep: (() -> Void)?
+    var getRiseSpeed: (() -> Float)?
     
     init(view: SCNView, isPreviewMode: Bool = false) {
         self.scene = SCNScene()
@@ -430,17 +778,19 @@ class BrickwellRenderer: NSObject, SCNSceneRendererDelegate {
         if lastUpdateTime == 0 { lastUpdateTime = time }
         let deltaTime = Float(time - lastUpdateTime)
         lastUpdateTime = time
-        
+
         if isRising {
-            fractionalRise += deltaTime * BrickwellConstants.riseSpeed
-            
+            // Use dynamic rise speed if available, otherwise fall back to constant
+            let currentSpeed = getRiseSpeed?() ?? BrickwellConstants.riseSpeed
+            fractionalRise += deltaTime * currentSpeed
+
             if fractionalRise >= 1.0 {
                 fractionalRise -= 1.0
                 DispatchQueue.main.async {
                     self.onRiseStep?()
                 }
             }
-            
+
             SCNTransaction.begin()
             SCNTransaction.animationDuration = 0
             worldNode.position.y = fractionalRise
@@ -894,6 +1244,149 @@ struct BackButton: View {
     }
 }
 
+// MARK: - Combo Indicator
+struct ComboIndicator: View {
+    let combo: Int
+    var theme: ThemeType = .elly
+
+    var body: some View {
+        if combo > 0 {
+            let isGalaxy = theme == .galaxy
+            let themeColors = ThemeColors.colors(for: theme)
+
+            HStack(spacing: 4) {
+                Text("COMBO")
+                    .font(.system(size: 12, weight: .bold))
+                Text("x\(combo + 1)")
+                    .font(.system(size: 14, weight: .black))
+            }
+            .foregroundColor(isGalaxy ? .white : DesignColors.golden)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(
+                Capsule()
+                    .fill(isGalaxy ? Color.black.opacity(0.6) : Color.white.opacity(0.9))
+            )
+            .transition(.scale.combined(with: .opacity))
+        }
+    }
+}
+
+// MARK: - Score Popup
+struct ScorePopup: View {
+    let score: Int
+    let isVisible: Bool
+    var theme: ThemeType = .elly
+
+    var body: some View {
+        if isVisible && score > 0 {
+            let isGalaxy = theme == .galaxy
+
+            Text("+\(score)")
+                .font(.system(size: 24, weight: .bold, design: .monospaced))
+                .foregroundColor(isGalaxy ? .white : DesignColors.golden)
+                .shadow(color: .black.opacity(0.3), radius: 2, x: 0, y: 2)
+                .transition(.asymmetric(
+                    insertion: .scale(scale: 0.5).combined(with: .opacity),
+                    removal: .move(edge: .top).combined(with: .opacity)
+                ))
+        }
+    }
+}
+
+// MARK: - Mini Piece Preview
+struct MiniPiecePreview: View {
+    let pieceType: TetrominoType?
+    let label: String
+    var theme: ThemeType = .elly
+    var isDisabled: Bool = false
+
+    private let blockSize: CGFloat = 12
+
+    var body: some View {
+        let isGalaxy = theme == .galaxy
+        let themeColors = ThemeColors.colors(for: theme)
+
+        VStack(spacing: 4) {
+            Text(label)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(isGalaxy ? themeColors.uiTextColor.opacity(0.7) : DesignColors.scoreGray)
+
+            ZStack {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(isGalaxy ? Color.black.opacity(0.5) : Color.white.opacity(0.9))
+                    .frame(width: 60, height: 50)
+
+                if let type = pieceType {
+                    pieceGrid(for: type)
+                        .opacity(isDisabled ? 0.4 : 1.0)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func pieceGrid(for type: TetrominoType) -> some View {
+        let shape = type.shape
+        let color = Color(type.color)
+        let rows = shape.count
+        let cols = shape[0].count
+
+        VStack(spacing: 2) {
+            ForEach(0..<rows, id: \.self) { r in
+                HStack(spacing: 2) {
+                    ForEach(0..<cols, id: \.self) { c in
+                        if shape[r][c] != 0 {
+                            RoundedRectangle(cornerRadius: 2)
+                                .fill(color)
+                                .frame(width: blockSize, height: blockSize)
+                        } else {
+                            Color.clear
+                                .frame(width: blockSize, height: blockSize)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Stats Summary View
+struct StatsSummaryView: View {
+    let stats: GameStats
+    let highScore: Int
+
+    var body: some View {
+        HStack(spacing: 20) {
+            StatItem(label: "Games", value: "\(stats.gamesPlayed)")
+            StatItem(label: "Best", value: "\(highScore)")
+            StatItem(label: "Lines", value: "\(stats.totalLinesCleared)")
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color.white.opacity(0.7))
+        )
+    }
+}
+
+struct StatItem: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        VStack(spacing: 2) {
+            Text(label)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(DesignColors.scoreGray)
+            Text(value)
+                .font(.system(size: 16, weight: .bold, design: .monospaced))
+                .foregroundColor(DesignColors.titleDark)
+        }
+    }
+}
+
 // MARK: - Start Screen
 struct StartScreenView: View {
     @ObservedObject var game: BrickwellGameManager
@@ -918,6 +1411,12 @@ struct StartScreenView: View {
                     .font(.system(size: 56, weight: .light))
                     .tracking(3.3)
                     .foregroundColor(DesignColors.titleDark)
+
+                // Stats summary (only show if player has played at least once)
+                if game.stats.gamesPlayed > 0 {
+                    StatsSummaryView(stats: game.stats, highScore: game.highScore)
+                        .padding(.top, 20)
+                }
 
                 Spacer()
 
@@ -946,6 +1445,19 @@ struct StartScreenView: View {
 // MARK: - Gameplay View
 struct GameplayView: View {
     @ObservedObject var game: BrickwellGameManager
+    @State private var showScorePopup = false
+    @State private var displayedScore = 0
+
+    // Gesture tracking state
+    @State private var dragStartLocation: CGPoint? = nil
+    @State private var currentDirection: Int = 0  // -1 left, 0 none, 1 right
+    @State private var hasTriggeredInitialMove = false
+    @State private var isVerticalGesture = false
+
+    // Thresholds for gesture detection
+    private let horizontalThreshold: CGFloat = 25
+    private let verticalThreshold: CGFloat = 30
+    private let hardDropVelocityThreshold: CGFloat = 500
 
     var body: some View {
         ZStack {
@@ -955,14 +1467,24 @@ struct GameplayView: View {
 
             // HUD Overlay
             VStack {
-                HStack {
-                    // Left side - Pause or Score (based on hand preference)
+                HStack(alignment: .top) {
+                    // Left side
                     if game.settings.isLeftHanded {
+                        // Left-handed: scores on left, pause + hold + next on right
                         scoreTabsView
                         Spacer()
-                        pauseButtonView
+                        VStack(alignment: .trailing, spacing: 12) {
+                            pauseButtonView
+                            holdPieceView
+                            nextPiecesView
+                        }
                     } else {
-                        pauseButtonView
+                        // Right-handed: pause + hold + next on left, scores on right
+                        VStack(alignment: .leading, spacing: 12) {
+                            pauseButtonView
+                            holdPieceView
+                            nextPiecesView
+                        }
                         Spacer()
                         scoreTabsView
                     }
@@ -971,31 +1493,166 @@ struct GameplayView: View {
                 .padding(.top, 60)
 
                 Spacer()
+
+                // Center area for combo and score popup
+                VStack(spacing: 16) {
+                    ScorePopup(score: displayedScore, isVisible: showScorePopup, theme: game.settings.theme)
+
+                    ComboIndicator(combo: game.currentCombo, theme: game.settings.theme)
+                        .animation(.spring(response: 0.3, dampingFraction: 0.6), value: game.currentCombo)
+                }
+
+                Spacer()
             }
         }
         .gesture(
-            DragGesture(minimumDistance: 20)
+            DragGesture(minimumDistance: 10)
+                .onChanged { value in
+                    handleDragChanged(value)
+                }
                 .onEnded { value in
-                    let horizontal = value.translation.width
-                    let vertical = value.translation.height
-
-                    if abs(horizontal) > abs(vertical) {
-                        if horizontal > 0 { game.move(dir: 1) }
-                        else { game.move(dir: -1) }
-                    } else if vertical > 50 {
-                        game.drop()
-                    }
+                    handleDragEnded(value)
                 }
         )
         .onTapGesture {
             game.rotate()
         }
+        .onChange(of: game.lastScoreEarned) { oldValue, newValue in
+            if newValue > 0 && newValue != oldValue {
+                displayedScore = newValue
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
+                    showScorePopup = true
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                    withAnimation(.easeOut(duration: 0.3)) {
+                        showScorePopup = false
+                    }
+                }
+            }
+        }
+    }
+
+    private func handleDragChanged(_ value: DragGesture.Value) {
+        // Initialize drag start location
+        if dragStartLocation == nil {
+            dragStartLocation = value.startLocation
+            hasTriggeredInitialMove = false
+            isVerticalGesture = false
+        }
+
+        let horizontal = value.translation.width
+        let vertical = value.translation.height
+
+        // Determine if this is primarily a vertical or horizontal gesture
+        if !hasTriggeredInitialMove {
+            if abs(vertical) > verticalThreshold && abs(vertical) > abs(horizontal) {
+                isVerticalGesture = true
+            } else if abs(horizontal) > horizontalThreshold && abs(horizontal) > abs(vertical) {
+                isVerticalGesture = false
+            }
+        }
+
+        if isVerticalGesture {
+            // Vertical gesture - handle soft drop
+            if vertical > verticalThreshold {
+                // Enable soft drop
+                if !game.inputState.isSoftDropping {
+                    game.inputState.isSoftDropping = true
+                }
+            }
+        } else {
+            // Horizontal gesture - handle left/right movement with DAS/ARR
+            let newDirection: Int
+            if horizontal > horizontalThreshold {
+                newDirection = 1  // Right
+            } else if horizontal < -horizontalThreshold {
+                newDirection = -1  // Left
+            } else {
+                newDirection = 0
+            }
+
+            // Direction changed
+            if newDirection != currentDirection {
+                currentDirection = newDirection
+
+                if newDirection != 0 {
+                    // Trigger immediate move and start DAS
+                    if !hasTriggeredInitialMove || newDirection != currentDirection {
+                        game.move(dir: newDirection)
+                        hasTriggeredInitialMove = true
+                    }
+
+                    // Set up input state for DAS/ARR
+                    game.inputState.isMovingLeft = (newDirection == -1)
+                    game.inputState.isMovingRight = (newDirection == 1)
+                    game.inputState.moveStartTime = Date()
+                    game.inputState.lastMoveTime = nil
+                } else {
+                    // Reset input state when returning to center
+                    game.inputState.isMovingLeft = false
+                    game.inputState.isMovingRight = false
+                    game.inputState.moveStartTime = nil
+                    game.inputState.lastMoveTime = nil
+                }
+            }
+        }
+    }
+
+    private func handleDragEnded(_ value: DragGesture.Value) {
+        let horizontal = value.translation.width
+        let vertical = value.translation.height
+        let velocity = value.predictedEndLocation.y - value.location.y
+
+        // Check for fast downward swipe (hard drop)
+        if vertical > verticalThreshold && velocity > hardDropVelocityThreshold {
+            game.drop()
+        } else if vertical < -verticalThreshold && abs(vertical) > abs(horizontal) {
+            // Swipe up to hold
+            game.holdPiece()
+        }
+
+        // Reset all input state
+        game.inputState.isMovingLeft = false
+        game.inputState.isMovingRight = false
+        game.inputState.isSoftDropping = false
+        game.inputState.moveStartTime = nil
+        game.inputState.lastMoveTime = nil
+
+        // Reset local gesture tracking state
+        dragStartLocation = nil
+        currentDirection = 0
+        hasTriggeredInitialMove = false
+        isVerticalGesture = false
     }
 
     private var pauseButtonView: some View {
         PauseButton(action: {
             game.pauseGame()
         }, theme: game.settings.theme)
+    }
+
+    private var holdPieceView: some View {
+        MiniPiecePreview(
+            pieceType: game.heldPiece,
+            label: "HOLD",
+            theme: game.settings.theme,
+            isDisabled: !game.canHold
+        )
+        .onTapGesture {
+            game.holdPiece()
+        }
+    }
+
+    private var nextPiecesView: some View {
+        VStack(spacing: 8) {
+            ForEach(Array(game.nextPieces.enumerated()), id: \.offset) { index, pieceType in
+                MiniPiecePreview(
+                    pieceType: pieceType,
+                    label: index == 0 ? "NEXT" : "",
+                    theme: game.settings.theme
+                )
+            }
+        }
     }
 
     private var scoreTabsView: some View {
@@ -1242,8 +1899,33 @@ class BrickwellGameManager: ObservableObject {
         }
     }
 
+    // Hold piece system
+    @Published var heldPiece: TetrominoType? = nil
+    @Published var canHold: Bool = true
+
+    // Next piece preview
+    @Published var nextPieces: [TetrominoType] = []
+
+    // Combo system
+    @Published var currentCombo: Int = 0
+    @Published var lastScoreEarned: Int = 0
+    @Published var totalLinesCleared: Int = 0
+
+    // Dynamic difficulty
+    var riseSpeedMultiplier: Float {
+        let increases = score / 500
+        return min(1.0 + (Float(increases) * 0.1), 3.0) // Cap at 3x speed
+    }
+
+    var currentRiseSpeed: Float {
+        return BrickwellConstants.riseSpeed * riseSpeedMultiplier
+    }
+
     // Settings
     @Published var settings = GameSettings()
+
+    // Persistent stats
+    @Published var stats = GameStats.load()
 
     var grid = Grid()
     var pieceBag: [TetrominoType] = []
@@ -1251,6 +1933,21 @@ class BrickwellGameManager: ObservableObject {
     var renderer: BrickwellRenderer?
 
     private var timer: Timer?
+
+    // Input state for DAS/ARR
+    var inputState = InputState()
+    private var inputTimer: Timer?
+
+    // Lock delay state
+    var lockDelayTimer: TimeInterval = 0
+    var lockResetCount: Int = 0
+    var softDropDistance: Int = 0
+    private var lastTickTime: Date = Date()
+
+    // Computed property: is piece on ground?
+    var isOnGround: Bool {
+        return !grid.isValid(shape: currentPiece.shape, x: currentPiece.x, y: currentPiece.y - 1)
+    }
 
     init() {
         // Load persisted high score
@@ -1261,6 +1958,10 @@ class BrickwellGameManager: ObservableObject {
            let theme = ThemeType(rawValue: savedTheme) {
             settings.theme = theme
         }
+
+        // Sync audio settings
+        SynthAudioManager.shared.setSFXEnabled(settings.soundEnabled)
+        SynthAudioManager.shared.setMusicEnabled(settings.musicEnabled)
     }
 
     // MARK: - Theme Management
@@ -1278,19 +1979,35 @@ class BrickwellGameManager: ObservableObject {
         grid = Grid()
         score = 0
         pieceBag = []
+        heldPiece = nil
+        canHold = true
+        currentCombo = 0
+        lastScoreEarned = 0
+        totalLinesCleared = 0
+
+        // Reset input and lock delay state
+        inputState = InputState()
+        lockDelayTimer = 0
+        lockResetCount = 0
+        softDropDistance = 0
+        lastTickTime = Date()
+
         currentPiece = Piece(type: getNextPiece())
+        updateNextPiecesPreview()
         renderer?.updateGrid(grid: grid, clearedRows: [], fallingPieces: [])
         renderer?.renderFallingPiece(piece: currentPiece, grid: grid, ghostY: getGhostY())
         renderer?.isRising = true
 
         // Start game loop
         start()
+        startInputTimer()
         gameState = .playing
     }
 
     func pauseGame() {
         timer?.invalidate()
         timer = nil
+        stopInputTimer()
         renderer?.isRising = false
         previousState = gameState
         gameState = .paused
@@ -1298,6 +2015,7 @@ class BrickwellGameManager: ObservableObject {
 
     func resumeGame() {
         start()
+        startInputTimer()
         renderer?.isRising = true
         gameState = .playing
     }
@@ -1328,6 +2046,7 @@ class BrickwellGameManager: ObservableObject {
     func quitToStart() {
         timer?.invalidate()
         timer = nil
+        stopInputTimer()
         renderer?.isRising = false
         gameState = .start
     }
@@ -1335,12 +2054,27 @@ class BrickwellGameManager: ObservableObject {
     func triggerGameOver() {
         timer?.invalidate()
         timer = nil
+        stopInputTimer()
         renderer?.isRising = false
+
+        // Audio & haptics
+        if settings.soundEnabled {
+            SynthAudioManager.shared.playGameOver()
+        }
+        HapticManager.error()
 
         // Update high score if needed
         if score > highScore {
             highScore = score
         }
+
+        // Update persistent stats
+        stats.gamesPlayed += 1
+        stats.totalLinesCleared += totalLinesCleared
+        if currentCombo > stats.bestCombo {
+            stats.bestCombo = currentCombo
+        }
+        stats.save()
 
         gameState = .gameOver
     }
@@ -1354,13 +2088,87 @@ class BrickwellGameManager: ObservableObject {
         }
     }
 
+    private func startInputTimer() {
+        inputTimer?.invalidate()
+        // 60Hz input processing for responsive DAS/ARR
+        inputTimer = Timer.scheduledTimer(withTimeInterval: 1.0/60.0, repeats: true) { [weak self] _ in
+            self?.processInput()
+        }
+    }
+
+    private func stopInputTimer() {
+        inputTimer?.invalidate()
+        inputTimer = nil
+        inputState = InputState()  // Reset input state when stopping
+    }
+
+    private var lastSoftDropTime: Date = Date()
+
+    private func processInput() {
+        guard gameState == .playing else { return }
+
+        let now = Date()
+
+        // Handle DAS/ARR for horizontal movement
+        if inputState.isMovingLeft || inputState.isMovingRight {
+            let dir = inputState.isMovingLeft ? -1 : 1
+
+            if let startTime = inputState.moveStartTime {
+                let elapsed = now.timeIntervalSince(startTime)
+
+                if elapsed >= InputConstants.dasDelay {
+                    // DAS active - check ARR
+                    if let lastMove = inputState.lastMoveTime {
+                        if now.timeIntervalSince(lastMove) >= InputConstants.arrInterval {
+                            move(dir: dir)
+                            inputState.lastMoveTime = now
+                        }
+                    } else {
+                        // First move after DAS delay
+                        move(dir: dir)
+                        inputState.lastMoveTime = now
+                    }
+                }
+            }
+        }
+
+        // Handle soft drop
+        if inputState.isSoftDropping {
+            if now.timeIntervalSince(lastSoftDropTime) >= InputConstants.softDropInterval {
+                softDrop()
+                lastSoftDropTime = now
+            }
+        }
+    }
+
     func tick() {
         guard gameState == .playing else { return }
+
+        let now = Date()
+        let deltaTime = now.timeIntervalSince(lastTickTime)
+        lastTickTime = now
+
         if grid.isValid(shape: currentPiece.shape, x: currentPiece.x, y: currentPiece.y - 1) {
+            // Piece can still fall
             currentPiece.y -= 1
+            lockDelayTimer = 0  // Reset lock delay when piece moves down naturally
             renderer?.renderFallingPiece(piece: currentPiece, grid: grid, ghostY: getGhostY())
         } else {
-            lock()
+            // Piece is on ground - use lock delay
+            lockDelayTimer += deltaTime
+
+            // Lock if delay exceeded OR max resets reached
+            if lockDelayTimer >= LockDelayConstants.lockDelay || lockResetCount >= LockDelayConstants.maxLockResets {
+                lock()
+            }
+        }
+    }
+
+    /// Reset lock delay when piece moves/rotates while grounded
+    private func resetLockDelay() {
+        if isOnGround && lockResetCount < LockDelayConstants.maxLockResets {
+            lockDelayTimer = 0
+            lockResetCount += 1
         }
     }
 
@@ -1368,34 +2176,160 @@ class BrickwellGameManager: ObservableObject {
         guard gameState == .playing else { return }
         if grid.isValid(shape: currentPiece.shape, x: currentPiece.x + dir, y: currentPiece.y) {
             currentPiece.x += dir
+            resetLockDelay()  // Reset lock delay on successful move
             renderer?.renderFallingPiece(piece: currentPiece, grid: grid, ghostY: getGhostY())
+
+            // Audio & haptics
+            if settings.soundEnabled {
+                SynthAudioManager.shared.playMove()
+            }
+            HapticManager.light()
         }
     }
+
+    // Wall-kick offsets to try when rotating
+    private let wallKickOffsets: [(dx: Int, dy: Int)] = [
+        (0, 0),   // No offset (try original position first)
+        (1, 0),   // Right
+        (-1, 0),  // Left
+        (0, 1),   // Up
+        (1, 1),   // Right-Up
+        (-1, 1)   // Left-Up
+    ]
 
     func rotate() {
         guard gameState == .playing else { return }
         var temp = currentPiece
         temp.shape = temp.rotate()
-        if grid.isValid(shape: temp.shape, x: temp.x, y: temp.y) {
-            currentPiece = temp
-            renderer?.renderFallingPiece(piece: currentPiece, grid: grid, ghostY: getGhostY())
+
+        // Try each wall-kick offset until we find a valid position
+        for offset in wallKickOffsets {
+            let testX = temp.x + offset.dx
+            let testY = temp.y + offset.dy
+            if grid.isValid(shape: temp.shape, x: testX, y: testY) {
+                temp.x = testX
+                temp.y = testY
+                currentPiece = temp
+                resetLockDelay()  // Reset lock delay on successful rotate
+                renderer?.renderFallingPiece(piece: currentPiece, grid: grid, ghostY: getGhostY())
+
+                // Audio & haptics
+                if settings.soundEnabled {
+                    SynthAudioManager.shared.playRotate()
+                }
+                HapticManager.light()
+                return
+            }
         }
+        // All offsets failed - don't rotate
     }
 
     func drop() {
         guard gameState == .playing else { return }
+        let startY = currentPiece.y
         while grid.isValid(shape: currentPiece.shape, x: currentPiece.x, y: currentPiece.y - 1) {
             currentPiece.y -= 1
         }
-        lock()
+        let dropDistance = startY - currentPiece.y
+        lock(hardDropDistance: dropDistance)
     }
 
-    func lock() {
+    /// Soft drop: move piece down 1 cell and award points
+    func softDrop() {
+        guard gameState == .playing else { return }
+        if grid.isValid(shape: currentPiece.shape, x: currentPiece.x, y: currentPiece.y - 1) {
+            currentPiece.y -= 1
+            softDropDistance += 1
+            score += ScoreValues.softDropPerCell
+            lockDelayTimer = 0  // Reset lock delay on soft drop
+            renderer?.renderFallingPiece(piece: currentPiece, grid: grid, ghostY: getGhostY())
+        }
+    }
+
+    func holdPiece() {
+        guard gameState == .playing, canHold else { return }
+
+        canHold = false
+
+        if let held = heldPiece {
+            // Swap current piece with held piece
+            let currentType = currentPiece.type
+            heldPiece = currentType
+            currentPiece = Piece(type: held)
+        } else {
+            // Store current piece and get new one from bag
+            heldPiece = currentPiece.type
+            currentPiece = Piece(type: getNextPiece())
+            updateNextPiecesPreview()
+        }
+
+        // Audio & haptics
+        if settings.soundEnabled {
+            SynthAudioManager.shared.playHold()
+        }
+        HapticManager.light()
+
+        // Check if new piece position is valid
+        if !grid.isValid(shape: currentPiece.shape, x: currentPiece.x, y: currentPiece.y) {
+            triggerGameOver()
+            return
+        }
+
+        renderer?.renderFallingPiece(piece: currentPiece, grid: grid, ghostY: getGhostY())
+    }
+
+    func lock(hardDropDistance: Int = 0) {
         let result = grid.place(piece: currentPiece)
-        score += result.clearedRows.count * 100
+        let linesCleared = result.clearedRows.count
+
+        // Calculate score
+        var earnedScore = 0
+
+        // Hard drop bonus
+        earnedScore += hardDropDistance * ScoreValues.hardDropPerCell
+
+        // Audio & haptics for landing
+        if settings.soundEnabled {
+            SynthAudioManager.shared.playLand()
+        }
+        HapticManager.medium()
+
+        // Line clear scoring
+        if linesCleared > 0 {
+            let baseLineScore = ScoreValues.scoreFor(linesCleared: linesCleared)
+            let comboMultiplier = ScoreValues.comboMultiplier(for: currentCombo)
+            earnedScore += Int(Double(baseLineScore) * comboMultiplier)
+
+            // Audio for line clears
+            if settings.soundEnabled {
+                SynthAudioManager.shared.playClear(lines: linesCleared)
+                if currentCombo > 0 {
+                    SynthAudioManager.shared.playCombo(level: currentCombo)
+                }
+            }
+            HapticManager.heavy()
+
+            currentCombo += 1
+            totalLinesCleared += linesCleared
+        } else {
+            // Reset combo when no lines cleared
+            currentCombo = 0
+        }
+
+        lastScoreEarned = earnedScore
+        score += earnedScore
+
         renderer?.updateGrid(grid: grid, clearedRows: result.clearedRows, fallingPieces: result.fallingBlocks)
 
         currentPiece = Piece(type: getNextPiece())
+        updateNextPiecesPreview()
+        canHold = true  // Allow hold again with new piece
+
+        // Reset lock delay state for new piece
+        lockDelayTimer = 0
+        lockResetCount = 0
+        softDropDistance = 0
+
         if !grid.isValid(shape: currentPiece.shape, x: currentPiece.x, y: currentPiece.y) {
             triggerGameOver()
             return
@@ -1436,10 +2370,23 @@ class BrickwellGameManager: ObservableObject {
     }
 
     private func getNextPiece() -> TetrominoType {
-        if pieceBag.isEmpty {
-            pieceBag = TetrominoType.allCases.shuffled()
-        }
+        ensureBagHasEnoughPieces(count: 1)
         return pieceBag.removeFirst()
+    }
+
+    private func ensureBagHasEnoughPieces(count: Int) {
+        while pieceBag.count < count {
+            pieceBag.append(contentsOf: TetrominoType.allCases.shuffled())
+        }
+    }
+
+    func getNextPieces(count: Int) -> [TetrominoType] {
+        ensureBagHasEnoughPieces(count: count)
+        return Array(pieceBag.prefix(count))
+    }
+
+    private func updateNextPiecesPreview() {
+        nextPieces = getNextPieces(count: 2)
     }
 
     func reset() {
@@ -1467,6 +2414,11 @@ struct BrickwellSceneView: UIViewRepresentable {
             // Link rising callback
             renderer.onRiseStep = {
                 game.riseStep()
+            }
+
+            // Link dynamic rise speed
+            renderer.getRiseSpeed = { [weak game] in
+                return game?.currentRiseSpeed ?? BrickwellConstants.riseSpeed
             }
 
             // Set rising based on current game state
